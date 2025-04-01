@@ -92,7 +92,7 @@ This is a concise overview of the security trade-offs and considerations of this
 
 ### Metadata
 
-- The only group specific metadata published to relays is the Nostr group ID value. This value is used to identify the group in the `h` tag of the Group Message Event (`kind: 445`). These events are published ephemerally and this Nostr group ID value can be updated over the lifetime of the group by group admins. This is a tradeoff to ensure that group participants and group size are obfuscated but still makes it possible to efficiently fan out group messages to all participants. The content field of this event is a value encrypted in two separate ways (using NIP-44 and MLS) with MLS group state/keys. Only group members with up-to-date group state can decrypt and read these messages.
+- The only group specific metadata published to relays is the Nostr group receiving address. This value is used to identify the group in the `p` tag of the Group Message Event (`kind: 1059`). This receiving address will change every epoch, derived from the MLS root key. After entering a new epoch, each member will automatically calculate the receiving address. This is a tradeoff to ensure that group participants and group size are obfuscated but still makes it possible to efficiently fan out group messages to all participants. The content field of this event is a value encrypted in two separate ways (using NIP-44 and MLS) with MLS group state/keys. Only group members with up-to-date group state can decrypt and read these messages.
 - A user's key package events can be used one or more times to be added to groups. There is a tradeoff inherent here: Reusing key packages (initial signing keys) carries some degree of risk but this risk is mitigated as long as a user rotates their signing key immediately upon joining a group. This step also improves the forward secrecy of the entire group.
 
 ### Device Compromise
@@ -135,17 +135,22 @@ A `Credential` also has an associated signing key. The initial signing key for a
 As mentioned above, the `nostr_group_data` extension is a required MLS extension used to associate Nostr-specific data with an MLS group in a cryptographically secure and proveable way. This extension MUST be included as a required capability when creating a new group.
 
 The extension stores the following data about the group:
-
-- `nostr_group_id`: A 32-byte ID for the group. This is a different value from the group ID used by MLS and CAN be changed over time. This value is the group ID value used in the `h` tags when sending group message events.
 - `name`: The name of the group.
 - `description`: A short description of the group.
 - `admin_pubkeys`: An array of the hex-encoded public keys of the group admins. The MLS protocol itself does not have a concept of group admins. Clients MUST check the list of `admin_pubkeys` before making any change to the group data (anything in this extension), or before changing group membership (add/remove members), or updating any other aspect of the group itself (e.g. ciphersuite, etc.). Note, all members of the group can send `Proposal` and `Commits` messages for changes to their own credentials (e.g. updating their signing key).
 - `relays`: An array of the Nostr relay URLs that the group uses to publish and receive messages.
+- `status`: default is `enabled`. If the administrator changes the status to `dissolved`, everyone should exit the group.
 
 All of these values can be updated over time using MLS `Proposal` and `Commit` events (by group admins).
 
-## KeyPackage Event and Signing Keys
+## LeafNode Extension
+- After each group member joins, they need to execute selfUpdate to modify the extension of the leafNode, for example: `{name:"alice",status:"enabled"}` and then broadcast `Commit Message` to all group members.
+- Once other group members receive the message, they execute Commit and will enter a new Epoch.
+The fileds
+- `name`: memeber's nickname.
+- `status`: default is enabled. If the member changes the status to `removed`, the administrator should remove the member and broadcast the `Commit Message` to group.
 
+## KeyPackage Event and Signing Keys
 Each user that wishes to be reachable via MLS-based messaging MUST first publish at least one KeyPackage event. The KeyPackage Event is used to authenticate users and create the necessary `Credential` to add members to groups in an asynchronous way. Users can publish multiple KeyPackage Events with different parameters (supporting different ciphersuites or MLS extensions, for example). KeyPackages include a signing key that is used for signing MLS messages within a group. This signing key MUST not be the same as the user's Nostr identity key.
 
 KeyPackage reuse SHOULD be minimized. However, in normal MLS use, KeyPackages are consumed when joining a group. In order to reduce race conditions between invites for multiple groups using the same Key Package, Nostr clients SHOULD use "Last resort" KeyPackages. This requires the inclusion of the `last_resort` extension on the KeyPackage's capabilities (same as with the Group).
@@ -159,10 +164,10 @@ In most cases, it's assumed that clients implementing this NIP will manage the c
 ```json
   {
     "id": <id>,
-    "kind": 443,
+    "kind": 10444,
     "created_at": <unix timestamp in seconds>,
     "pubkey": <main identity pubkey>,
-    "content": "",
+    "content": <base64_encode(KeyPackageBundle)>,
     "tags": [
         ["mls_protocol_version", "1.0"],
         ["ciphersuite", <MLS CipherSuite ID value e.g. "0x0001">],
@@ -174,8 +179,8 @@ In most cases, it's assumed that clients implementing this NIP will manage the c
     "sig": <signed with main identity key>
 }
 ```
-
-- The `content` hex encoded serialized `KeyPackageBundle` from MLS.
+- Kind `10444` is for replaceable event. Only one such event is stored on each relay per pubkey.
+- The `content` base64 encoded serialized `KeyPackageBundle` from MLS.
 - The `mls_protocol_version` tag is required and MUST be the version number of the MLS protocol version being used. For now, this is `1.0`.
 - The `ciphersuite` tag is the value of the MLS ciphersuite that this KeyPackage Event supports. [Read more about ciphersuites in MLS](https://www.rfc-editor.org/rfc/rfc9420.html#name-mls-cipher-suites).
 - The `extensions` tag is an array of MLS extension IDs that this KeyPackage Event supports. [Read more about MLS extensions](https://www.rfc-editor.org/rfc/rfc9420.html#name-extensions).
@@ -183,7 +188,9 @@ In most cases, it's assumed that clients implementing this NIP will manage the c
 - The `relays` tag identifies each of the relays that the client will attempt to publish this KeyPackage event. This allows for deletion of KeyPackage Events at a later date.
 - (optional) The `-` tag can be used to ensure that KeyPackage Events are only published by their authenticated author. Read more in [NIP-70](70.md)
 
-### Deleting KeyPackage Events
+### Deleting And Uploading KeyPackage Events
+When the app launches, it uploads a new KeyPackage to relays.
+After joining a group, the client should delete other KeyPackages in the local database and upload a new KeyPackage to relays.
 
 Clients SHOULD delete the KeyPackage Event on all the listed relays any time they successfully process a group request event for a given KeyPackage Event. Clients MAY also create a new KeyPackage Event at the same time.
 
@@ -193,21 +200,6 @@ If clients cannot process a Welcome message (e.g. because the signing key was ge
 
 Clients MUST regularly rotate the user's signing key in each group that they are a part of. The more often the signing key is rotated the stronger the post-compromise security. This rotation is done via `Proposal` and `Commit` events and broadcast to the group via a Group Event. [Read more about forward secrecy and post-compromise security inherent in MLS](https://www.rfc-editor.org/rfc/rfc9420.html#name-forward-secrecy-and-post-co).
 
-### KeyPackage Relays List Event
-
-A `kind: 10051` event indicates the relays that a user will publish their KeyPackage Events to. The event MUST include a list of relay tags with relay URIs. These relays SHOULD be readable by anyone the user wants to be able to contact them.
-
-```json
-{
-  "kind": 10051,
-  "tags": [
-    ["relay", "wss://inbox.nostr.wine"],
-    ["relay", "wss://myrelay.nostr1.com"],
-  ],
-  "content": "",
-  //...other fields
-}
-```
 
 ### Welcome Event
 
@@ -221,24 +213,26 @@ Clients creating the Welcome Event SHOULD wait until they have received acknowle
    "kind": 444,
    "created_at": <unix timestamp in seconds>,
    "pubkey": <nostr identity pubkey of sender>,
-   "content": <serialized Welcome object>,
+   "content": <base64<serialized Welcome object>>,
    "tags": [
-      ["e", <ID of the KeyPackage Event used to add the user to the group>],
-      ["relays", <array of relay urls>],
    ],
    "sig": <NOT SIGNED>
 }
 ```
 
-- The `content` field is required and is a serialized MLSMessage object containing the MLS `Welcome` object.
-- The `e` tag is required and is the ID of the KeyPackage Event used to add the user to the group.
-- The `relays` tag is required and is a list of relays clients should query for Group Events.
+- The `content` field is required and is a serialized MLSMessage object containing the MLS `Welcome` object and encoded by base64.
 
 Welcome Events are then sealed and gift-wrapped as detailed in [NIP-59](59.md) before being published. Like all events that are sealed and gift-wrapped, `kind: 444` events MUST never be signed. This ensures that if they were ever leaked they would not be publishable to relays.
 
 #### Large Groups
 
 For groups above ~150 participants, welcome messages will become larger than the maximum event size allowed by Nostr. There is currently work underway on the MLS protocol to support "light" client welcomes that don't require the full Ratchet Tree state to be sent to the new member. This section will be updated with recommendations for how to handle large groups.
+
+## Rotating Receiving address
+- When the group enters a new epoch, client should generated a new nostr keypair from the MLS [`exporter_secret`](https://www.rfc-editor.org/rfc/rfc9420.html#section-8.5).
+- The `exporter_secret` value should be generated with a 32-byte length and labeled `nostr`. This `exporter_secret` value is rotated on each new epoch in the group. Clients should generate a new 32-byte value each time they process a valid `Commit` message.
+- Use the private key perform encryption and decryption according to nip44.
+- Listen for the new public key to receive messages from the group, which is in the `p` field of the tag within the event.
 
 ## Group Events
 
@@ -249,20 +243,20 @@ Group Events are published using an ephemeral Nostr keypair to obfuscate the num
 ```json
 {
    "id": <id>,
-   "kind": 445,
+   "kind": 1059,
    "created_at": <unix timestamp in seconds>,
    "pubkey": <ephemeral sender pubkey>,
    "content": <NIP-44 encrypted serialized MLSMessage object>,
    "tags": [
-      ["h", <group id>]
+      ["p", <group receiving address>]
    ],
    "sig": <signed with ephemeral sender key>
 }
 ```
-- The `content` field is a [tls-style](https://www.rfc-editor.org/rfc/rfc9420.html#name-the-message-mls-media-type) serialized [`MLSMessage`](https://www.rfc-editor.org/rfc/rfc9420.html#section-6-4) object which is then encrypted according to [NIP-44](44.md). However, instead of using the sender and receivers keys the NIP-44 encryption is done using a Nostr keypair generated from the MLS [`exporter_secret`](https://www.rfc-editor.org/rfc/rfc9420.html#section-8.5) to calulate the `conversation key` value. Essentially, you use the hex-encoded `exporter_secret` value as the private key, calculate the public key, and then use those two keys to encrypt and decrypt messages.
-- The `exporter_secret` value should be generated with a 32-byte length and labeled `nostr`. This `exporter_secret` value is rotated on each new epoch in the group. Clients should generate a new 32-byte value each time they process a valid `Commit` message.
+- The `content` field is a [tls-style](https://www.rfc-editor.org/rfc/rfc9420.html#name-the-message-mls-media-type) serialized [`MLSMessage`](https://www.rfc-editor.org/rfc/rfc9420.html#section-6-4) object which is then encrypted according to [NIP-44](44.md). 
 - The `pubkey` is the hex-encoded public key of the ephemeral sender.
-- The `h` tag is the nostr group ID value (from the Nostr Group Data Extension).
+- The `p` tag is the nostr group receiving address. It is the pubkey of `exporter_secret`.
+
 
 ### Application Messages
 
